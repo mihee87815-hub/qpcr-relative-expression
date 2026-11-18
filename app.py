@@ -1,6 +1,7 @@
 """Streamlit entry point: streamlit run app.py"""
 
 import matplotlib.pyplot as plt
+import numpy as np
 import streamlit as st
 
 from qpcr_analysis import QPCRInputError, analyze, parse_sample_code, read_qpcr_upload
@@ -15,6 +16,7 @@ uploaded = st.file_uploader("qPCR 결과 파일", type=["csv", "xls", "xlsx"])
 if uploaded is not None:
     try:
         data, instrument_export = read_qpcr_upload(uploaded.getvalue(), uploaded.name)
+        sample_codes = {}
         excluded_wells = data.attrs.get("excluded_wells", [])
         excluded_ct_rows = data.attrs.get("excluded_ct_rows", 0)
         if excluded_wells:
@@ -35,8 +37,12 @@ if uploaded is not None:
             factors = mapping["기기 시료명"].map(parse_sample_code)
             if factors.notna().all():
                 factor_table = mapping[["기기 시료명"]].copy()
-                factor_table[["돌연변이체 코드", "ABA 처리 코드", "스트레스"]] = list(factors)
-                st.caption("시료 코드 해석: 첫 숫자=돌연변이체, 가운데=ABA 처리량 코드, X/H=스트레스 없음/있음. ABA 단위는 실험 기록으로 확인하세요.")
+                factor_table[["실험군", "ABA 처리 코드", "온도"]] = [
+                    ({"0": "Col-1", "1": "ost1"}[item[0]], item[1],
+                     {"X": "상온", "H": "고온"}[str(name)[-1]])
+                    for name, item in zip(mapping["기기 시료명"], factors)
+                ]
+                st.caption("시료 코드 해석: 0=Col-1, 1=ost1, X=상온, H=고온. ABA 단위는 실험 기록으로 확인하세요.")
                 st.dataframe(factor_table, hide_index=True)
             edited = st.data_editor(mapping, hide_index=True, disabled=["기기 시료명"], key="sample_mapping")
             if edited["실험 조건"].isna().any() or edited["실험 조건"].astype(str).str.strip().eq("").any():
@@ -44,11 +50,14 @@ if uploaded is not None:
                 st.stop()
             if edited["생물학적 시료 ID"].isna().any() or edited["생물학적 시료 ID"].astype(str).str.strip().eq("").any():
                 raise QPCRInputError("생물학적 시료 ID에 빈 값이 있습니다.")
+            sample_codes = dict(zip(edited["생물학적 시료 ID"].astype(str).str.strip(), edited["기기 시료명"].astype(str)))
             data = data.merge(edited, left_on="Sample", right_on="기기 시료명", validate="many_to_one")
             data["Sample"] = data["생물학적 시료 ID"].astype(str).str.strip()
             data["Condition"] = data["실험 조건"].astype(str).str.strip()
             data["Replicate"] = data.groupby(["Sample", "Condition", "Gene"]).cumcount() + 1
             data = data[["Sample", "Condition", "Gene", "Replicate", "Ct"]]
+        else:
+            sample_codes = {str(sample): str(sample) for sample in data["Sample"].unique()}
         if not {"Sample", "Condition", "Gene", "Replicate", "Ct"}.issubset(data.columns):
             raise QPCRInputError("필수 열이 없습니다: Sample, Condition, Gene, Replicate, Ct")
         genes = sorted(data["Gene"].dropna().astype(str).unique())
@@ -80,25 +89,41 @@ if uploaded is not None:
             st.subheader("기술 반복 QC")
             st.dataframe(result.technical_qc, hide_index=True)
 
-            fig, ax = plt.subplots(figsize=(9, 5))
-            groups = result.sample_results.groupby(["Gene", "Condition"], sort=True)
-            labels = []
-            for i, ((gene, condition), group) in enumerate(groups):
-                ax.scatter([i] * len(group), group["Fold_Change"], alpha=0.7)
-                geo_mean = result.summary.loc[
-                    (result.summary["Gene"] == gene) & (result.summary["Condition"] == condition),
-                    "Geometric_Mean_FC",
-                ].iloc[0]
-                ax.scatter(i, geo_mean, marker="_", s=450, linewidths=3, color="black")
-                labels.append(f"{gene}\n{condition}")
-            ax.set_xticks(range(len(labels)), labels)
-            ax.set_ylabel("Fold change (2^-ΔΔCt)")
-            ax.axhline(1, linestyle="--", color="gray")
-            ax.set_yscale("log", base=2)
-            ax.set_title("Dots: biological samples; black bars: geometric mean")
-            fig.tight_layout()
-            st.pyplot(fig)
-            plt.close(fig)
+            plotted = result.sample_results.copy()
+            plotted["시료 코드"] = plotted["Sample"].map(sample_codes)
+            factors = plotted["시료 코드"].map(parse_sample_code)
+            if factors.notna().all():
+                plotted["실험군"] = factors.map(lambda item: {"0": "Col-1", "1": "ost1"}[item[0]])
+                plotted["ABA 코드"] = factors.map(lambda item: int(item[1]))
+                plotted["온도"] = plotted["시료 코드"].str[-1].map({"X": "상온", "H": "고온"})
+                st.caption("시료 코드 기준: X=상온, H=고온, 0=Col-1, 1=ost1. ABA 값은 파일에 단위가 없어 처리 코드로 표시합니다. 점=생물학적 시료, 검은 가로선=기하평균.")
+                for gene, gene_data in plotted.groupby("Gene", sort=True):
+                    st.subheader(f"{gene} — 온도·실험군·ABA별 발현량")
+                    fig, axes = plt.subplots(2, 2, figsize=(11, 7), sharex=True, sharey=True)
+                    doses = sorted(gene_data["ABA 코드"].unique())
+                    for row, temperature in enumerate(("상온", "고온")):
+                        for col, genotype in enumerate(("Col-1", "ost1")):
+                            ax = axes[row, col]
+                            panel = gene_data[(gene_data["온도"] == temperature) & (gene_data["실험군"] == genotype)]
+                            for x, dose in enumerate(doses):
+                                values = panel.loc[panel["ABA 코드"] == dose, "Fold_Change"].to_numpy()
+                                if len(values):
+                                    offsets = np.linspace(-0.08, 0.08, len(values)) if len(values) > 1 else [0]
+                                    ax.scatter(np.full(len(values), x) + offsets, values, alpha=0.75)
+                                    ax.scatter(x, np.exp(np.log(values).mean()), marker="_", s=450, linewidths=3, color="black")
+                            temperature_label = {"상온": "Ambient", "고온": "Heat"}[temperature]
+                            ax.set_title(f"{temperature_label} · {genotype}")
+                            ax.set_xticks(range(len(doses)), [str(dose) for dose in doses])
+                            ax.axhline(1, linestyle="--", color="gray", linewidth=1)
+                            ax.set_yscale("log", base=2)
+                            ax.set_xlabel("ABA dose code")
+                            if col == 0:
+                                ax.set_ylabel("Fold change (2^-DeltaDeltaCt)")
+                    fig.tight_layout()
+                    st.pyplot(fig)
+                    plt.close(fig)
+            else:
+                st.warning("시료 코드가 00X/05H 형식이 아니어서 온도·실험군·ABA별 그래프를 그릴 수 없습니다. 결과 표와 CSV는 확인할 수 있습니다.")
 
             csv = result.sample_results.to_csv(index=False).encode("utf-8-sig")
             st.download_button("시료별 결과 CSV 다운로드", csv, "qpcr_sample_results.csv", "text/csv")
