@@ -1,9 +1,13 @@
 """Streamlit entry point: streamlit run app.py"""
 
+from io import BytesIO
+import hashlib
+
 import matplotlib.pyplot as plt
 import streamlit as st
 
 from qpcr_analysis import QPCRInputError, analyze, parse_sample_code, read_qpcr_upload
+from qpcr_plot import FACTOR_COLUMNS, PLOT_TYPES, make_figure, ordered_values, prepare_plot_data
 
 
 st.set_page_config(page_title="qPCR 상대 발현량 분석", layout="wide")
@@ -15,6 +19,7 @@ uploaded = st.file_uploader("qPCR 결과 파일", type=["csv", "xls", "xlsx"])
 if uploaded is not None:
     try:
         data, instrument_export = read_qpcr_upload(uploaded.getvalue(), uploaded.name)
+        sample_codes = {}
         excluded_wells = data.attrs.get("excluded_wells", [])
         excluded_ct_rows = data.attrs.get("excluded_ct_rows", 0)
         if excluded_wells:
@@ -35,8 +40,12 @@ if uploaded is not None:
             factors = mapping["기기 시료명"].map(parse_sample_code)
             if factors.notna().all():
                 factor_table = mapping[["기기 시료명"]].copy()
-                factor_table[["돌연변이체 코드", "ABA 처리 코드", "스트레스"]] = list(factors)
-                st.caption("시료 코드 해석: 첫 숫자=돌연변이체, 가운데=ABA 처리량 코드, X/H=스트레스 없음/있음. ABA 단위는 실험 기록으로 확인하세요.")
+                factor_table[["실험군", "ABA 처리 코드", "온도"]] = [
+                    ({"0": "Col-1", "1": "ost1"}[item[0]], item[1],
+                     {"X": "상온", "H": "고온"}[str(name)[-1]])
+                    for name, item in zip(mapping["기기 시료명"], factors)
+                ]
+                st.caption("시료 코드 해석: 0=Col-1, 1=ost1, X=상온, H=고온. ABA 단위는 실험 기록으로 확인하세요.")
                 st.dataframe(factor_table, hide_index=True)
             edited = st.data_editor(mapping, hide_index=True, disabled=["기기 시료명"], key="sample_mapping")
             if edited["실험 조건"].isna().any() or edited["실험 조건"].astype(str).str.strip().eq("").any():
@@ -44,11 +53,14 @@ if uploaded is not None:
                 st.stop()
             if edited["생물학적 시료 ID"].isna().any() or edited["생물학적 시료 ID"].astype(str).str.strip().eq("").any():
                 raise QPCRInputError("생물학적 시료 ID에 빈 값이 있습니다.")
+            sample_codes = dict(zip(edited["생물학적 시료 ID"].astype(str).str.strip(), edited["기기 시료명"].astype(str)))
             data = data.merge(edited, left_on="Sample", right_on="기기 시료명", validate="many_to_one")
             data["Sample"] = data["생물학적 시료 ID"].astype(str).str.strip()
             data["Condition"] = data["실험 조건"].astype(str).str.strip()
             data["Replicate"] = data.groupby(["Sample", "Condition", "Gene"]).cumcount() + 1
             data = data[["Sample", "Condition", "Gene", "Replicate", "Ct"]]
+        else:
+            sample_codes = {str(sample): str(sample) for sample in data["Sample"].unique()}
         if not {"Sample", "Condition", "Gene", "Replicate", "Ct"}.issubset(data.columns):
             raise QPCRInputError("필수 열이 없습니다: Sample, Condition, Gene, Replicate, Ct")
         genes = sorted(data["Gene"].dropna().astype(str).unique())
@@ -66,39 +78,66 @@ if uploaded is not None:
         st.caption("기술 반복 1회인 묶음은 SD를 계산할 수 없습니다. SD 기준 초과 묶음은 결과에 표시되며 원본 증폭곡선을 확인해야 합니다.")
         st.dataframe(data.head(20), hide_index=True)
 
+        analysis_key = hashlib.sha256(
+            (data.to_csv(index=False) + repr((reference, control, max_sd, int(min_reps), allow_high_sd))).encode("utf-8")
+        ).hexdigest()
         if st.button("분석 실행", type="primary"):
-            result = analyze(data, reference, control, max_sd, int(min_reps), allow_high_sd)
+            st.session_state["qpcr_result"] = analyze(data, reference, control, max_sd, int(min_reps), allow_high_sd)
+            st.session_state["qpcr_result_key"] = analysis_key
+        result = st.session_state.get("qpcr_result") if st.session_state.get("qpcr_result_key") == analysis_key else None
+        if result is not None:
             st.info("상대 발현량 계산 완료. 기술 반복 QC 표와 경고를 함께 확인하세요. 이 결과는 탐색적 계산입니다.")
             for warning in result.warnings:
                 st.warning(warning)
-            st.subheader("조건별 요약")
-            st.dataframe(result.summary, hide_index=True)
-            st.subheader("기준 유전자 Ct")
-            st.dataframe(result.reference_summary, hide_index=True)
-            st.subheader("생물학적 시료별 결과")
-            st.dataframe(result.sample_results, hide_index=True)
-            st.subheader("기술 반복 QC")
-            st.dataframe(result.technical_qc, hide_index=True)
+            st.subheader("그래프 그리기 도우미")
+            plotted = prepare_plot_data(result.sample_results, sample_codes)
+            coded = all(column in plotted for column in FACTOR_COLUMNS)
+            st.caption("시료 점은 독립 생물학적 시료입니다. 막대와 선은 기하평균이며 n은 생물학적 시료 수입니다. n=1에는 오차막대를 그리지 않습니다.")
+            if coded:
+                st.caption("시료 코드: X=상온, H=고온, 0=Col-1, 1=ost1. ABA 값은 실험 기록의 단위가 없어 코드로 표시합니다.")
+            else:
+                st.info("시료 코드가 00X/05H 형식이 아니어서 실험 조건별 그래프만 제공합니다.")
+            graph_key = analysis_key[:12]
+            gene = st.selectbox("그래프 유전자", sorted(plotted["Gene"].unique()), key=f"gene_{graph_key}")
+            chart_options = PLOT_TYPES if coded else PLOT_TYPES[:2]
+            chart_type = st.selectbox("그래프 형식", chart_options, key=f"chart_{graph_key}")
+            dimensions = {"실험 조건": "Condition"}
+            if coded:
+                dimensions = {"ABA 농도 코드": "ABA 코드", "온도": "온도", "실험군": "실험군", **dimensions}
+            x_options = ["ABA 농도 코드"] if chart_type == "기하평균 선" else list(dimensions)
+            x_label = st.selectbox("가로축", x_options, key=f"x_{chart_type}_{graph_key}")
+            x_column = dimensions[x_label]
+            group_options = {label: column for label, column in dimensions.items() if column != x_column}
+            series_label = st.selectbox("색상으로 구분", ["없음", *group_options], key=f"series_{x_label}_{graph_key}")
+            series_column = group_options.get(series_label)
+            facet_options = {label: column for label, column in group_options.items() if column != series_column}
+            facet_label = st.selectbox("패널 나누기", ["없음", *facet_options], key=f"facet_{x_label}_{series_label}_{graph_key}")
+            facet_column = facet_options.get(facet_label)
+            filtered = plotted.loc[plotted["Gene"] == gene].copy()
+            for label, column in dimensions.items():
+                values = ordered_values(filtered[column], column)
+                selected = st.multiselect(f"{label} 선택", values, default=values, key=f"filter_{column}_{graph_key}")
+                filtered = filtered.loc[filtered[column].isin(selected)]
+            log_scale = st.checkbox("Y축 로그2", value=True, key=f"log_{graph_key}")
+            if filtered.empty:
+                st.warning("선택한 조건에 표시할 시료가 없습니다.")
+            else:
+                fig = make_figure(filtered, gene, chart_type, x_column, series_column, facet_column, log_scale)
+                st.pyplot(fig)
+                image = BytesIO()
+                fig.savefig(image, format="png", dpi=200, bbox_inches="tight")
+                st.download_button("그래프 PNG 다운로드", image.getvalue(), f"qpcr_{gene}_plot.png", "image/png")
+                plt.close(fig)
 
-            fig, ax = plt.subplots(figsize=(9, 5))
-            groups = result.sample_results.groupby(["Gene", "Condition"], sort=True)
-            labels = []
-            for i, ((gene, condition), group) in enumerate(groups):
-                ax.scatter([i] * len(group), group["Fold_Change"], alpha=0.7)
-                geo_mean = result.summary.loc[
-                    (result.summary["Gene"] == gene) & (result.summary["Condition"] == condition),
-                    "Geometric_Mean_FC",
-                ].iloc[0]
-                ax.scatter(i, geo_mean, marker="_", s=450, linewidths=3, color="black")
-                labels.append(f"{gene}\n{condition}")
-            ax.set_xticks(range(len(labels)), labels)
-            ax.set_ylabel("Fold change (2^-ΔΔCt)")
-            ax.axhline(1, linestyle="--", color="gray")
-            ax.set_yscale("log", base=2)
-            ax.set_title("Dots: biological samples; black bars: geometric mean")
-            fig.tight_layout()
-            st.pyplot(fig)
-            plt.close(fig)
+            with st.expander("상세 결과표 및 QC"):
+                st.subheader("조건별 요약")
+                st.dataframe(result.summary, hide_index=True)
+                st.subheader("기준 유전자 Ct")
+                st.dataframe(result.reference_summary, hide_index=True)
+                st.subheader("생물학적 시료별 결과")
+                st.dataframe(result.sample_results, hide_index=True)
+                st.subheader("기술 반복 QC")
+                st.dataframe(result.technical_qc, hide_index=True)
 
             csv = result.sample_results.to_csv(index=False).encode("utf-8-sig")
             st.download_button("시료별 결과 CSV 다운로드", csv, "qpcr_sample_results.csv", "text/csv")
