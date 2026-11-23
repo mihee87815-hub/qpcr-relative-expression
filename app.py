@@ -8,6 +8,7 @@ import streamlit as st
 
 from qpcr_analysis import QPCRInputError, analyze, parse_sample_code, read_qpcr_upload
 from qpcr_plot import FACTOR_COLUMNS, PLOT_TYPES, make_figure, ordered_values, prepare_plot_data
+from qpcr_report import write_report
 
 
 st.set_page_config(page_title="qPCR 상대 발현량 분석", layout="wide")
@@ -138,6 +139,16 @@ if uploaded is not None:
                 st.dataframe(result.sample_results, hide_index=True)
                 st.subheader("기술 반복 QC")
                 st.dataframe(result.technical_qc, hide_index=True)
+
+            st.subheader("결과 보고서 작성 도우미")
+            st.caption("관찰값과 계산 근거를 연결해 설명합니다. 통계적 유의성이나 생물학적 기작은 추정하지 않습니다.")
+            report_title = st.text_input("보고서 제목", value="qPCR 상대 발현량 결과 보고서")
+            experiment_note = st.text_area("실험 정보·질문 (선택)", help="ABA 농도와 단위, 처리 시간, 시료 채취 시점 등을 기록하세요.")
+            report = write_report(result, reference, control, report_title, experiment_note, sample_codes)
+            with st.expander("보고서 미리보기", expanded=True):
+                st.markdown(report)
+            st.download_button("보고서 Markdown 다운로드", report.encode("utf-8-sig"),
+                               "qpcr_report.md", "text/markdown")
 
             csv = result.sample_results.to_csv(index=False).encode("utf-8-sig")
             st.download_button("시료별 결과 CSV 다운로드", csv, "qpcr_sample_results.csv", "text/csv")
