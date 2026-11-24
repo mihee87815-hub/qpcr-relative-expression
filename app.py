@@ -9,6 +9,7 @@ import streamlit as st
 from qpcr_analysis import QPCRInputError, analyze, parse_sample_code, read_qpcr_upload
 from qpcr_plot import FACTOR_COLUMNS, PLOT_TYPES, make_figure, ordered_values, prepare_plot_data
 from qpcr_report import write_report
+from qpcr_merge import read_files, merge_samples
 
 
 st.set_page_config(page_title="qPCR 상대 발현량 분석", layout="wide")
@@ -16,11 +17,29 @@ st.title("qPCR 상대 발현량 분석")
 st.write("시료별 기술 반복 Ct를 평균낸 뒤 ΔCt, ΔΔCt, 2^-ΔΔCt를 계산합니다.")
 st.caption("앱 형식 CSV 또는 QuantStudio Results 시트가 있는 XLS/XLSX 파일을 올리세요.")
 
-uploaded = st.file_uploader("qPCR 결과 파일", type=["csv", "xls", "xlsx"])
-if uploaded is not None:
+uploads = st.file_uploader("qPCR 결과 파일 (최대 3개)", type=["csv", "xls", "xlsx"], accept_multiple_files=True)
+if uploads:
     try:
-        data, instrument_export = read_qpcr_upload(uploaded.getvalue(), uploaded.name)
         sample_codes = {}
+        if len(uploads) > 3:
+            raise QPCRInputError("파일은 최대 3개까지 올릴 수 있습니다. 추가 파일을 제거하세요.")
+        if len(uploads) > 1:
+            combined, mapping, audit = read_files([(f.name, f.getvalue()) for f in uploads])
+            st.subheader("파일 통합 설정")
+            st.dataframe(audit, hide_index=True)
+            st.info("기본값은 파일마다 독립 생물학적 시료로 구분합니다. 같은 실제 시료를 재측정한 파일이면 생물학적 시료 ID를 동일하게 바꾸세요. 독립 시료라도 처리 조건이 같으면 실험 조건을 같게 지정하세요.")
+            mapping_key = hashlib.sha256(b''.join(f.getvalue() for f in uploads)).hexdigest()[:12]
+            edited_multi = st.data_editor(mapping, hide_index=True, disabled=["입력 ID", "파일", "원본 시료명"], key=f"merge_{mapping_key}")
+            st.warning("서로 다른 실험일·플레이트의 Ct를 통합하려면 측정 조건과 기준 유전자 안정성, 공통 보정 시료를 확인해야 합니다. 이 앱은 파일 간 배치 효과를 보정하지 않습니다.")
+            confirmed = st.checkbox("파일 간 시료 관계와 통합 가능한 측정 조건을 확인했습니다", key=f"confirm_{mapping_key}")
+            if not confirmed:
+                st.stop()
+            data, sample_codes = merge_samples(combined, edited_multi)
+            instrument_export = False
+            st.download_button("통합 시료 설정 CSV 다운로드", edited_multi.to_csv(index=False).encode("utf-8-sig"), "qpcr_file_mapping.csv", "text/csv")
+        else:
+            uploaded = uploads[0]
+            data, instrument_export = read_qpcr_upload(uploaded.getvalue(), uploaded.name)
         excluded_wells = data.attrs.get("excluded_wells", [])
         excluded_ct_rows = data.attrs.get("excluded_ct_rows", 0)
         if excluded_wells:
@@ -60,7 +79,7 @@ if uploaded is not None:
             data["Condition"] = data["실험 조건"].astype(str).str.strip()
             data["Replicate"] = data.groupby(["Sample", "Condition", "Gene"]).cumcount() + 1
             data = data[["Sample", "Condition", "Gene", "Replicate", "Ct"]]
-        else:
+        elif not sample_codes:
             sample_codes = {str(sample): str(sample) for sample in data["Sample"].unique()}
         if not {"Sample", "Condition", "Gene", "Replicate", "Ct"}.issubset(data.columns):
             raise QPCRInputError("필수 열이 없습니다: Sample, Condition, Gene, Replicate, Ct")
@@ -144,7 +163,10 @@ if uploaded is not None:
             st.caption("관찰값과 계산 근거를 연결해 설명합니다. 통계적 유의성이나 생물학적 기작은 추정하지 않습니다.")
             report_title = st.text_input("보고서 제목", value="qPCR 상대 발현량 결과 보고서")
             experiment_note = st.text_area("실험 정보·질문 (선택)", help="ABA 농도와 단위, 처리 시간, 시료 채취 시점 등을 기록하세요.")
-            report = write_report(result, reference, control, report_title, experiment_note, sample_codes)
+            report_note = experiment_note
+            if len(uploads) > 1:
+                report_note += "\n통합 파일: " + ", ".join(f.name for f in uploads) + "\n파일 간 배치 효과는 보정하지 않았습니다. 생물학적 반복 수는 사용자가 지정한 시료 ID를 기준으로 계산했습니다."
+            report = write_report(result, reference, control, report_title, report_note, sample_codes)
             with st.expander("보고서 미리보기", expanded=True):
                 st.markdown(report)
             st.download_button("보고서 Markdown 다운로드", report.encode("utf-8-sig"),
