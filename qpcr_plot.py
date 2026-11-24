@@ -17,6 +17,8 @@ AXIS_LABELS = {
     "ABA 코드": "ABA dose code",
     "온도": "Temperature",
     "실험군": "Genotype",
+    "ABA 농도": "ABA dose (unit unspecified)",
+    "염 수준": "Salt level",
 }
 
 
@@ -29,13 +31,20 @@ def prepare_plot_data(sample_results: pd.DataFrame, sample_codes: dict[str, str]
         plotted["실험군"] = factors.map(lambda item: {"0": "Col-1", "1": "ost1"}[item[0]])
         plotted["ABA 코드"] = factors.map(lambda item: int(item[1]))
         plotted["온도"] = plotted["시료 코드"].str[-1].map({"X": "상온", "H": "고온"})
+    else:
+        salt = plotted["시료 코드"].astype(str).str.extract(r"^\s*(\d+(?:\.\d+)?)\s+(0|LOW|HIGH)\s*$", flags=2)
+        if salt.notna().all().all():
+            plotted["ABA 농도"] = salt[0].astype(float)
+            plotted["염 수준"] = salt[1].str.upper()
     return plotted
 
 
 def ordered_values(values: pd.Series, column: str) -> list:
     unique = set(values.dropna())
-    if column == "ABA 코드":
+    if column in ("ABA 코드", "ABA 농도"):
         return sorted(unique)
+    if column == "염 수준":
+        return [value for value in ("0", "LOW", "HIGH") if value in unique]
     if column == "온도":
         return [value for value in ("상온", "고온") if value in unique]
     if column == "실험군":
@@ -57,7 +66,7 @@ def make_figure(
         raise ValueError("지원하지 않는 그래프 형식입니다.")
     if x_column not in data or (series_column and series_column not in data) or (facet_column and facet_column not in data):
         raise ValueError("선택한 그래프 변수가 데이터에 없습니다.")
-    if chart_type == "기하평균 선" and x_column != "ABA 코드":
+    if chart_type == "기하평균 선" and x_column not in ("ABA 코드", "ABA 농도"):
         raise ValueError("선 그래프의 가로축은 ABA 코드만 선택할 수 있습니다.")
     subset = data.loc[data["Gene"] == gene].copy()
     if subset.empty:
@@ -106,7 +115,7 @@ def make_figure(
         ax.set_xticks(range(len(x_values)), [str(TEMPERATURE_LABELS.get(x, x)) for x in x_values])
         ax.set_xlabel(AXIS_LABELS.get(x_column, x_column))
         if facet is not None:
-            ax.set_title(str(TEMPERATURE_LABELS.get(facet, facet)))
+            ax.set_title(f"{AXIS_LABELS.get(facet_column, facet_column)} = {TEMPERATURE_LABELS.get(facet, facet)}")
         ax.axhline(1, linestyle="--", color="gray", linewidth=1)
         if log_scale:
             ax.set_yscale("log", base=2)
